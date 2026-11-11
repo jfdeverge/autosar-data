@@ -77,13 +77,13 @@
 #![warn(missing_docs)]
 
 use autosar_data_specification::{AttributeSpec, CharacterDataSpec, ContentMode, ElementType};
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use indexmap::IndexMap;
 pub use iterators::*;
 use parking_lot::RwLock;
 use parser::ArxmlParser;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::SmallVec;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, Bound, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::{fs::File, io::Read};
@@ -161,6 +161,20 @@ pub(crate) struct AutosarModelRaw {
     /// recomputed at the moment it is needed: de-registration happens while element locks are held and
     /// after the element has been detached from the tree, when its base can no longer be resolved.
     relative_references: FxHashMap<WeakElement, Option<String>>, // referencing element -> target path
+    /// Sorted copies of the keys of `identifiables` and `reference_origins`.
+    ///
+    /// `fix_element_paths` and `fix_reference_paths` need the subset of keys that lie inside a
+    /// remapped path prefix. Scanning every key on every call makes a run that moves N subtrees
+    /// in a model holding M identifiable elements cost O(N*M); on a multi-file ARXML composition
+    /// workload the key scans dominated the runtime and grew quadratically with the number of
+    /// input files.
+    ///
+    /// A path-ordered key set turns the prefix lookup into a range scan over exactly the matching
+    /// keys, maintained incrementally wherever the maps themselves are mutated. The results are
+    /// unchanged: the visited keys, and the order in which they are visited, are the ones the full
+    /// scans produced.
+    path_index: BTreeSet<String>,
+    refpath_index: BTreeSet<String>,
 }
 
 /// The error type `AutosarDataError` wraps all errors that can be generated anywhere in the crate

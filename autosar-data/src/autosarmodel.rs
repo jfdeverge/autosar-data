@@ -45,11 +45,25 @@ enum MergeUndo {
 /// "/package10/Elem" is not considered to be inside "/package1".
 pub(crate) fn replace_path_prefix(path: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
     let suffix = path.strip_prefix(old_prefix)?;
-    if suffix.is_empty() || suffix.starts_with('/') {
+    if is_component_boundary(suffix) {
         Some(format!("{new_prefix}{suffix}"))
     } else {
         None
     }
+}
+
+/// returns true if `prefix` is `path` itself or a prefix of it at a '/' boundary
+///
+/// This is the prefix test used by the path index range scans. Unlike a plain `str::starts_with`,
+/// it respects the '/' path component boundaries, so "/package10/Elem" is not considered to be
+/// inside "/package1".
+pub(crate) fn is_path_prefix_of(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix).is_some_and(is_component_boundary)
+}
+
+/// returns true if `suffix` is the empty remainder of a path prefix match, or starts a new component
+fn is_component_boundary(suffix: &str) -> bool {
+    suffix.is_empty() || suffix.starts_with('/')
 }
 
 /// `PathRemap` describes how Autosar paths change as the result of a rename or move operation
@@ -76,6 +90,11 @@ impl PathRemap {
     /// Returns `None` if the path is not affected by this remapping.
     pub(crate) fn map(&self, path: &str) -> Option<String> {
         self.0.iter().find_map(|(old, new)| replace_path_prefix(path, old, new))
+    }
+
+    /// the (old prefix, new prefix) pairs of this remapping, in order
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &(String, String)> {
+        self.0.iter()
     }
 
     /// returns true if this remapping does not change any path
@@ -132,6 +151,8 @@ impl AutosarModel {
             identifiables: FxIndexMap::default(),
             reference_origins: FxHashMap::default(),
             relative_references: FxHashMap::default(),
+            path_index: BTreeSet::new(),
+            refpath_index: BTreeSet::new(),
             root_element: root_elem.clone(),
         }
         .wrap();
@@ -296,6 +317,7 @@ impl AutosarModel {
                     break;
                 }
             } else {
+                data.path_index.insert(key.clone());
                 data.identifiables.insert(key, value);
             }
         }
@@ -314,6 +336,7 @@ impl AutosarModel {
             if base.is_some() {
                 data.relative_references.insert(referring_element, None);
             } else {
+                data.refpath_index.insert(refpath.clone());
                 data.reference_origins
                     .entry(refpath)
                     .or_default()
@@ -858,6 +881,8 @@ impl AutosarModel {
                 locked_model.identifiables.clear();
                 locked_model.reference_origins.clear();
                 locked_model.relative_references.clear();
+                locked_model.path_index.clear();
+                locked_model.refpath_index.clear();
             } else {
                 // other files still contribute elements, so only the elements specifically associated with this file should be removed
                 let _ = self.root_element().remove_from_file(file);
@@ -1211,6 +1236,54 @@ impl AutosarModel {
             .unwrap_or_default()
     }
 
+    /// return all elements whose reference resolves to a path under `prefix`
+    ///
+    /// `prefix` is matched on path component boundaries: the prefix itself and every path nested
+    /// below it are selected, while `/package10/Elem` is not selected by `/package1`.
+    ///
+    /// This is the bulk form of [`Self::get_references_to`], for callers that have to rewrite every
+    /// reference pointing into a subtree that is being renamed or moved. Since `reference_origins`
+    /// is keyed by the resolved target path, a range scan over its sorted keys replaces walking the
+    /// element tree for each rewritten element.
+    ///
+    /// Absolute references are registered under their character data, so for those the result is
+    /// exactly the references whose text lies under the prefix. Relative references are registered
+    /// under their *resolved* target path while their character data stays relative; callers that
+    /// match on the character data must keep filtering the result themselves.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use autosar_data::*;
+    /// # fn main() -> Result<(), AutosarDataError> {
+    /// # let model = AutosarModel::new();
+    /// for element in model.references_under_path_prefix("/Path/To") {
+    ///     // [...]
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn references_under_path_prefix(&self, prefix: &str) -> Vec<Element> {
+        let model = self.0.read();
+        let mut out = Vec::new();
+        for key in model
+            .refpath_index
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if !is_path_prefix_of(key, prefix) {
+                continue;
+            }
+            if let Some(reflist) = model.reference_origins.get(key) {
+                out.extend(reflist.iter().filter_map(WeakElement::upgrade));
+            }
+        }
+        out
+    }
+
     /// check all Autosar path references and return a list of elements with invalid references
     ///
     /// For each reference: The target must exist and the DEST attribute must correctly specify the type of the target
@@ -1303,6 +1376,7 @@ impl AutosarModel {
     /// Add an identifiable element to the cache
     pub(crate) fn add_identifiable(&self, new_path: String, elem: WeakElement) {
         let mut model = self.0.write();
+        model.path_index.insert(new_path.clone());
         model.identifiables.insert(new_path, elem);
     }
 
@@ -1316,12 +1390,18 @@ impl AutosarModel {
         let mut model = self.0.write();
 
         // the renamed element might contain other identifiable elements that are affected by the renaming
-        let keys: Vec<String> = model.identifiables.keys().cloned().collect();
+        //
+        // Only the keys inside a remapped prefix can be affected; collecting the complete key list
+        // here meant one full scan of `identifiables` per move, which is quadratic over a pipeline
+        // that moves many elements. The result is the same key sequence that the full scan produced.
+        let keys = model.keys_under_remap_identifiable(remap);
         for key in keys {
             // find keys referring to entries inside the renamed/moved subtree
             if let Some(new_key) = remap.map(&key) {
                 // fix the identifiables hashmap
                 if let Some(entry) = model.identifiables.swap_remove(&key) {
+                    model.path_index.remove(&key);
+                    model.path_index.insert(new_key.clone());
                     model.identifiables.insert(new_key, entry);
                 }
             }
@@ -1347,7 +1427,11 @@ impl AutosarModel {
         // Check all references and update those that point to a renamed/moved element. Since the key is
         // the path of the target, this applies to relative references in exactly the same way; only the
         // character data that has to be written back differs between the two.
-        let refpaths = model.reference_origins.keys().cloned().collect::<Vec<String>>();
+        //
+        // Only the keys inside a remapped prefix need the (expensive) per-reference rewrite below.
+        // Collecting every key relied on `remap.map` returning None for the others, i.e. one full
+        // scan of `reference_origins` per move.
+        let refpaths = model.keys_under_remap_refpaths(remap);
         for refpath in refpaths {
             // if the existing reference points into a renamed/moved subtree, then it needs to be updated
             let Some(refpath_new) = remap.map(&refpath).filter(|new| *new != refpath) else {
@@ -1356,6 +1440,7 @@ impl AutosarModel {
             let Some(reflist) = model.reference_origins.remove(&refpath) else {
                 continue;
             };
+            model.refpath_index.remove(&refpath);
             let mut updated = Vec::with_capacity(reflist.len());
             let mut unchanged = Vec::new();
             for weak_ref_elem in reflist {
@@ -1392,9 +1477,11 @@ impl AutosarModel {
                 }
             }
             if !updated.is_empty() {
+                model.refpath_index.insert(refpath_new.clone());
                 model.reference_origins.insert(refpath_new, updated);
             }
             if !unchanged.is_empty() {
+                model.refpath_index.insert(refpath.clone());
                 model.reference_origins.insert(refpath, unchanged);
             }
         }
@@ -1405,7 +1492,9 @@ impl AutosarModel {
     // remove a deleted element from the cache
     pub(crate) fn remove_identifiable(&self, path: &str) {
         let mut model = self.0.write();
-        model.identifiables.swap_remove(path);
+        if model.identifiables.swap_remove(path).is_some() {
+            model.path_index.remove(path);
+        }
     }
 
     /// Register a reference element
@@ -1421,6 +1510,7 @@ impl AutosarModel {
         if base.is_some() {
             data.relative_references.insert(origin, None);
         } else {
+            data.refpath_index.insert(new_ref.to_owned());
             data.reference_origins
                 .entry(new_ref.to_owned())
                 .or_default()
@@ -1489,7 +1579,10 @@ impl AutosarModel {
                 model.remove_reference_origin_by_key(&old_key, &origin);
             }
             match new_key {
-                Some(new_key) => model.reference_origins.entry(new_key).or_default().push(origin),
+                Some(new_key) => {
+                    model.refpath_index.insert(new_key.clone());
+                    model.reference_origins.entry(new_key).or_default().push(origin);
+                }
                 // the reference base is not in scope: the reference has no target path, and the entry
                 // is only kept so that check_references() can report it
                 None => {
@@ -1511,7 +1604,56 @@ impl AutosarModel {
     }
 }
 
+/// the keys of `index` that are `prefix` itself or nested inside it
+///
+/// The index is sorted by path, so the matching keys form one contiguous range; the range ends at
+/// the first key which no longer carries the prefix.
+fn keys_under_prefix<'a>(index: &'a BTreeSet<String>, prefix: &str) -> impl Iterator<Item = &'a String> {
+    index
+        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .take_while(move |key| key.starts_with(prefix))
+        .filter(move |key| is_path_prefix_of(key, prefix))
+}
+
 impl AutosarModelRaw {
+    /// all keys of `identifiables` inside one of the remap's old prefixes, in `identifiables`
+    /// insertion order - the order in which `keys()` yielded them
+    ///
+    /// `swap_remove` moves the last entry into the hole of a removed one, so the insertion order of
+    /// `identifiables` is observable through the iterator and through `Debug`, and the fixers must
+    /// visit the same keys in the same order as they did when they walked the whole map.
+    fn keys_under_remap_identifiable(&self, remap: &PathRemap) -> Vec<String> {
+        let mut hits: Vec<(usize, &String)> = Vec::new();
+        for (old, _new) in remap.entries() {
+            for key in keys_under_prefix(&self.path_index, old) {
+                if let Some(ord) = self.identifiables.get_index_of(key) {
+                    hits.push((ord, key));
+                }
+            }
+        }
+        // a key can lie inside several of the remap's prefixes; it is still a single map entry, and
+        // the full scan visited it once
+        hits.sort_unstable_by_key(|(ord, _)| *ord);
+        hits.dedup_by_key(|(ord, _)| *ord);
+        hits.into_iter().map(|(_, key)| key.clone()).collect()
+    }
+
+    /// all keys of `reference_origins` inside one of the remap's old prefixes
+    ///
+    /// Each key is rewritten independently of the others, so the order does not matter here; the
+    /// order of `reference_origins` is not observable because it is a `HashMap`. A key which lies
+    /// inside several of the remap's prefixes is still a single map entry and is returned once, as
+    /// it was by the full scan.
+    fn keys_under_remap_refpaths(&self, remap: &PathRemap) -> Vec<String> {
+        let mut keys = BTreeSet::new();
+        for (old, _new) in remap.entries() {
+            keys.extend(
+                keys_under_prefix(&self.refpath_index, old).filter(|key| self.reference_origins.contains_key(*key)),
+            );
+        }
+        keys.into_iter().cloned().collect()
+    }
+
     pub(crate) fn wrap(self) -> AutosarModel {
         AutosarModel(Arc::new(RwLock::new(self)))
     }
@@ -1551,6 +1693,7 @@ impl AutosarModelRaw {
             }
             if origins.is_empty() {
                 self.reference_origins.remove(key);
+                self.refpath_index.remove(key);
             }
         }
     }
@@ -1770,6 +1913,25 @@ impl AutosarModel {
                     element.xml_path()
                 ));
             }
+        }
+
+        // each path index mirrors the keys of the map it indexes: every key is in the index, and
+        // the index contains nothing else
+        let expected_paths: BTreeSet<&String> = model.identifiables.keys().collect();
+        if model.path_index.iter().ne(expected_paths.iter().copied()) {
+            return Err(format!(
+                "path_index does not match the keys of identifiables: {} index entries, {} keys",
+                model.path_index.len(),
+                model.identifiables.len()
+            ));
+        }
+        let expected_refpaths: BTreeSet<&String> = model.reference_origins.keys().collect();
+        if model.refpath_index.iter().ne(expected_refpaths.iter().copied()) {
+            return Err(format!(
+                "refpath_index does not match the keys of reference_origins: {} index entries, {} keys",
+                model.refpath_index.len(),
+                model.reference_origins.len()
+            ));
         }
 
         Ok(())
