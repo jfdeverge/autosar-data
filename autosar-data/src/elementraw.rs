@@ -1192,6 +1192,60 @@ impl ElementRaw {
         }
     }
 
+    /// Check that `order` is a schema-legal order of the sub elements of this element
+    ///
+    /// `order` must contain exactly the current sub elements; this is verified by the caller.
+    /// In a `Sequence` the sub elements are kept sorted by their position in the schema. In a
+    /// `Choice` at most one alternative is selected, so all sub elements must belong to the same
+    /// alternative; within it they may appear in any order. `Bag` and `Mixed` accept any order.
+    ///
+    /// The comparison uses the spec with the element's own version, falling back to all versions
+    /// for sub elements a non-strict load retained even though they are not valid in that version.
+    pub(crate) fn is_valid_sub_element_order(&self, order: &[Element], version: AutosarVersion) -> bool {
+        let elemtype = self.elemtype;
+        // (schema position, content mode of the group the sub element belongs to)
+        let mut positions: Vec<(Vec<usize>, ContentMode)> = Vec::with_capacity(order.len());
+        for elem in order {
+            let elemname = elem.0.read().elemname;
+            let Some((_, indices)) = elemtype
+                .find_sub_element(elemname, version as u32)
+                .or_else(|| elemtype.find_sub_element(elemname, u32::MAX))
+            else {
+                return false;
+            };
+            // find_common_group always succeeds here, since both index lists were returned by find_sub_element
+            let Some(group) = elemtype.find_common_group(&indices, &indices) else {
+                return false;
+            };
+            positions.push((indices, group.content_mode()));
+        }
+
+        match self.elemtype.content_mode() {
+            ContentMode::Sequence => {
+                // every pair of sub elements that shares a group has to be sorted by the schema
+                for (pos, left) in positions.iter().enumerate() {
+                    for right in positions.iter().skip(pos + 1) {
+                        let Some(group) = elemtype.find_common_group(&left.0, &right.0) else {
+                            continue;
+                        };
+                        if group.content_mode() == ContentMode::Sequence && left.0 > right.0 {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            ContentMode::Choice => {
+                // all sub elements must belong to the same alternative, i.e. have identical indices
+                positions
+                    .first()
+                    .is_none_or(|(first, _)| positions.iter().all(|(indices, _)| indices == first))
+            }
+            ContentMode::Bag | ContentMode::Mixed => true,
+            ContentMode::Characters => false,
+        }
+    }
+
     /// remove the sub element `sub_element`
     ///
     /// The `sub_element` will be unlinked from the hierarchy of elements. All of the sub-sub-elements nested under the removed element will also be recursively removed.

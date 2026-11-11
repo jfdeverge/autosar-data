@@ -175,6 +175,16 @@ pub(crate) struct AutosarModelRaw {
     /// scans produced.
     path_index: BTreeSet<String>,
     refpath_index: BTreeSet<String>,
+    /// `short name -> paths` index over `identifiables`.
+    ///
+    /// Resolving a dangling reference by its last path segment requires every identifiable whose
+    /// short name equals a given string. Doing that by scanning `identifiables` (an
+    /// `FxIndexMap` of every named element) costs one model lock plus a key clone per element;
+    /// tools that run such lookups per unresolved reference need a hash probe instead.
+    ///
+    /// Maintained at every key mutation of `identifiables`. Each bucket keeps `identifiables`
+    /// insertion order, so a lookup returns the same sequence a full scan would.
+    shortname_index: FxHashMap<String, Vec<String>>,
 }
 
 /// The error type `AutosarDataError` wraps all errors that can be generated anywhere in the crate

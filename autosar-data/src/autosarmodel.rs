@@ -153,6 +153,7 @@ impl AutosarModel {
             relative_references: FxHashMap::default(),
             path_index: BTreeSet::new(),
             refpath_index: BTreeSet::new(),
+            shortname_index: FxHashMap::default(),
             root_element: root_elem.clone(),
         }
         .wrap();
@@ -318,6 +319,7 @@ impl AutosarModel {
                 }
             } else {
                 data.path_index.insert(key.clone());
+                data.insert_shortname(&key);
                 data.identifiables.insert(key, value);
             }
         }
@@ -883,6 +885,7 @@ impl AutosarModel {
                 locked_model.relative_references.clear();
                 locked_model.path_index.clear();
                 locked_model.refpath_index.clear();
+                locked_model.shortname_index.clear();
             } else {
                 // other files still contribute elements, so only the elements specifically associated with this file should be removed
                 let _ = self.root_element().remove_from_file(file);
@@ -1377,7 +1380,50 @@ impl AutosarModel {
     pub(crate) fn add_identifiable(&self, new_path: String, elem: WeakElement) {
         let mut model = self.0.write();
         model.path_index.insert(new_path.clone());
+        model.insert_shortname(&new_path);
         model.identifiables.insert(new_path, elem);
+    }
+
+    /// All identifiable elements whose short name (last path segment) is `name`, in
+    /// `identifiables` insertion order — the order a linear scan of the index produces.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use autosar_data::*;
+    /// let model = AutosarModel::new();
+    /// let file = model.create_file("test", AutosarVersion::Autosar_00050).unwrap();
+    /// let root = model.root_element();
+    /// let pkgs = root.create_sub_element(ElementName::ArPackages).unwrap();
+    /// let pkg = pkgs.create_named_sub_element(ElementName::ArPackage, "Pkg").unwrap();
+    /// let found = model.identifiables_with_shortname("Pkg");
+    /// assert_eq!(found.len(), 1);
+    /// assert_eq!(found[0], pkg);
+    /// ```
+    #[must_use]
+    pub fn identifiables_with_shortname(&self, name: &str) -> Vec<Element> {
+        let model = self.0.read();
+        let Some(paths) = model.shortname_index.get(name) else {
+            return Vec::new();
+        };
+        if paths.len() == 1 {
+            // the common case: a short name is unique, so there is only one order to return
+            return paths
+                .iter()
+                .filter_map(|p| model.identifiables.get(p).and_then(WeakElement::upgrade))
+                .collect();
+        }
+        // `identifiables` uses `swap_remove`, so the bucket order is not the map order. Sort the
+        // matching paths by their position in the map, which is what a linear scan yields.
+        let mut indexed: Vec<(usize, &String)> = paths
+            .iter()
+            .filter_map(|path| model.identifiables.get_index_of(path).map(|ord| (ord, path)))
+            .collect();
+        indexed.sort_unstable_by_key(|(ord, _)| *ord);
+        indexed
+            .into_iter()
+            .filter_map(|(_, p)| model.identifiables.get(p).and_then(WeakElement::upgrade))
+            .collect()
     }
 
     /// Fix the caches after one or more subtrees of elements have been renamed or moved.
@@ -1402,6 +1448,8 @@ impl AutosarModel {
                 if let Some(entry) = model.identifiables.swap_remove(&key) {
                     model.path_index.remove(&key);
                     model.path_index.insert(new_key.clone());
+                    model.remove_shortname(&key);
+                    model.insert_shortname(&new_key);
                     model.identifiables.insert(new_key, entry);
                 }
             }
@@ -1494,6 +1542,7 @@ impl AutosarModel {
         let mut model = self.0.write();
         if model.identifiables.swap_remove(path).is_some() {
             model.path_index.remove(path);
+            model.remove_shortname(path);
         }
     }
 
@@ -1616,6 +1665,39 @@ fn keys_under_prefix<'a>(index: &'a BTreeSet<String>, prefix: &str) -> impl Iter
 }
 
 impl AutosarModelRaw {
+    /// Register `path`'s last segment in the short-name index; mirrors `identifiables`.
+    fn insert_shortname(&mut self, path: &str) {
+        let Some(name) = path.rsplit('/').next() else {
+            return;
+        };
+        if name.is_empty() {
+            return;
+        }
+        let entry = self.shortname_index.entry(name.to_string()).or_default();
+        if entry.iter().any(|p| p == path) {
+            return;
+        }
+        // The bucket is kept unordered here: `identifiables` insertion order is recovered by the
+        // lookup. `identifiables` uses `swap_remove`, so a removal moves an arbitrary other entry
+        // into the hole and the order cannot be maintained by appending. Ordering the bucket on
+        // insert would also need a `get_index_of` probe per inserted element, which makes insertion
+        // quadratic over the whole model.
+        entry.push(path.to_string());
+    }
+
+    /// Drop `path` from the short-name index.
+    fn remove_shortname(&mut self, path: &str) {
+        let Some(name) = path.rsplit('/').next() else {
+            return;
+        };
+        if let Some(bucket) = self.shortname_index.get_mut(name) {
+            bucket.retain(|p| p != path);
+            if bucket.is_empty() {
+                self.shortname_index.remove(name);
+            }
+        }
+    }
+
     /// all keys of `identifiables` inside one of the remap's old prefixes, in `identifiables`
     /// insertion order - the order in which `keys()` yielded them
     ///
@@ -1932,6 +2014,38 @@ impl AutosarModel {
                 model.refpath_index.len(),
                 model.reference_origins.len()
             ));
+        }
+
+        // the short-name index maps each short name to exactly the paths of `identifiables` which end
+        // in it
+        let mut expected_shortnames: FxHashMap<&str, Vec<&String>> = FxHashMap::default();
+        for path in model.identifiables.keys() {
+            if let Some(name) = path.rsplit('/').next()
+                && !name.is_empty()
+            {
+                expected_shortnames.entry(name).or_default().push(path);
+            }
+        }
+        if model.shortname_index.len() != expected_shortnames.len() {
+            return Err(format!(
+                "shortname_index holds {} names, but identifiables contains {} distinct short names",
+                model.shortname_index.len(),
+                expected_shortnames.len()
+            ));
+        }
+        for (name, paths) in &expected_shortnames {
+            let Some(indexed) = model.shortname_index.get(*name) else {
+                return Err(format!("shortname_index is missing the entry for \"{name}\""));
+            };
+            let mut indexed_sorted: Vec<&str> = indexed.iter().map(String::as_str).collect();
+            indexed_sorted.sort_unstable();
+            let mut expected_sorted: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+            expected_sorted.sort_unstable();
+            if indexed_sorted != expected_sorted {
+                return Err(format!(
+                    "shortname_index[\"{name}\"] is {indexed:?}, expected the paths {paths:?}"
+                ));
+            }
         }
 
         Ok(())
@@ -2381,6 +2495,122 @@ mod test {
         assert_eq!(identifiable_elements[3].0, "/OuterPackage2");
         assert_eq!(identifiable_elements[4].0, "/OuterPackage2/InnerPackage1");
         assert_eq!(identifiable_elements[5].0, "/OuterPackage2/InnerPackage2");
+    }
+
+    #[test]
+    fn identifiables_with_shortname() {
+        const FILEBUF: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES>
+        <AR-PACKAGE><SHORT-NAME>OuterPackage1</SHORT-NAME>
+            <AR-PACKAGES>
+                <AR-PACKAGE><SHORT-NAME>InnerPackage1</SHORT-NAME></AR-PACKAGE>
+                <AR-PACKAGE><SHORT-NAME>InnerPackage2</SHORT-NAME></AR-PACKAGE>
+            </AR-PACKAGES>
+        </AR-PACKAGE>
+        <AR-PACKAGE><SHORT-NAME>OuterPackage2</SHORT-NAME>
+            <AR-PACKAGES>
+                <AR-PACKAGE><SHORT-NAME>InnerPackage1</SHORT-NAME></AR-PACKAGE>
+                <AR-PACKAGE><SHORT-NAME>InnerPackage2</SHORT-NAME></AR-PACKAGE>
+            </AR-PACKAGES>
+        </AR-PACKAGE>
+        </AR-PACKAGES></AUTOSAR>"#;
+        let model = AutosarModel::new();
+        model.load_buffer(FILEBUF.as_bytes(), "test", true).unwrap();
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+
+        // the two packages share the short name; both are found, in identifiables order
+        let found = model.identifiables_with_shortname("InnerPackage1");
+        assert_eq!(found.len(), 2);
+        let expected: Vec<String> = model
+            .identifiable_elements()
+            .map(|(path, _)| path)
+            .filter(|path| path.ends_with("/InnerPackage1"))
+            .collect();
+        let actual: Vec<String> = found.iter().map(|e| e.path().unwrap()).collect();
+        assert_eq!(actual, expected);
+
+        // an unknown name yields nothing
+        assert!(model.identifiables_with_shortname("Nonexistent").is_empty());
+
+        // a removal keeps the result in identifiables order: the surviving package of each name is
+        // the one that `swap_remove` did not move
+        model
+            .get_element_by_path("/OuterPackage1")
+            .unwrap()
+            .remove_sub_element_kind(ElementName::ArPackages)
+            .unwrap();
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+        let found = model.identifiables_with_shortname("InnerPackage1");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path().unwrap(), "/OuterPackage2/InnerPackage1");
+
+        // a rename moves the entry to the new name
+        model
+            .get_element_by_path("/OuterPackage2/InnerPackage1")
+            .unwrap()
+            .set_item_name("Renamed")
+            .unwrap();
+        assert!(model.identifiables_with_shortname("InnerPackage1").is_empty());
+        assert_eq!(model.identifiables_with_shortname("Renamed").len(), 1);
+        assert_eq!(model.verify_reference_caches(), Ok(()));
+    }
+
+    #[test]
+    fn references_under_path_prefix() {
+        const FILEBUF: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+        <AUTOSAR xsi:schemaLocation="http://autosar.org/schema/r4.0 AUTOSAR_00050.xsd" xmlns="http://autosar.org/schema/r4.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <AR-PACKAGES>
+        <AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME>
+            <ELEMENTS>
+                <SYSTEM><SHORT-NAME>System</SHORT-NAME>
+                    <FIBEX-ELEMENTS>
+                        <FIBEX-ELEMENT-REF-CONDITIONAL>
+                            <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE">/Pkg/Sub/Ecu</FIBEX-ELEMENT-REF>
+                        </FIBEX-ELEMENT-REF-CONDITIONAL>
+                        <FIBEX-ELEMENT-REF-CONDITIONAL>
+                            <FIBEX-ELEMENT-REF DEST="ECU-INSTANCE">/Pkg/Sub2/Ecu</FIBEX-ELEMENT-REF>
+                        </FIBEX-ELEMENT-REF-CONDITIONAL>
+                    </FIBEX-ELEMENTS>
+                </SYSTEM>
+            </ELEMENTS>
+        </AR-PACKAGE>
+        <AR-PACKAGE><SHORT-NAME>Sub</SHORT-NAME>
+            <ELEMENTS><ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE></ELEMENTS>
+        </AR-PACKAGE>
+        <AR-PACKAGE><SHORT-NAME>Sub2</SHORT-NAME>
+            <ELEMENTS><ECU-INSTANCE><SHORT-NAME>Ecu</SHORT-NAME></ECU-INSTANCE></ELEMENTS>
+        </AR-PACKAGE>
+        </AR-PACKAGES></AUTOSAR>"#;
+        let model = AutosarModel::new();
+        model.load_buffer(FILEBUF.as_bytes(), "test", true).unwrap();
+
+        // the prefix selects the subtree; "/Pkg/Sub2/Ecu" is not inside "/Pkg/Sub"
+        let under_sub = model.references_under_path_prefix("/Pkg/Sub");
+        assert_eq!(under_sub.len(), 1);
+        assert_eq!(
+            under_sub[0].character_data().unwrap().string_value().unwrap(),
+            "/Pkg/Sub/Ecu"
+        );
+        assert_eq!(model.references_under_path_prefix("/Pkg/Sub2").len(), 1);
+        // the whole package contains both
+        assert_eq!(model.references_under_path_prefix("/Pkg").len(), 2);
+        // a path component boundary is respected: "/Pkg/Su" is not a prefix of "/Pkg/Sub"
+        assert!(model.references_under_path_prefix("/Pkg/Su").is_empty());
+        assert!(model.references_under_path_prefix("/Nonexistent").is_empty());
+
+        // for an exact reference target the bulk query agrees with get_references_to. A prefix that
+        // is only an ancestor of the targets selects them, so the two differ for "/Pkg"
+        for path in ["/Pkg/Sub/Ecu", "/Pkg/Sub2/Ecu"] {
+            let bulk: Vec<Element> = model.references_under_path_prefix(path);
+            let single: Vec<Element> = model
+                .get_references_to(path)
+                .iter()
+                .filter_map(WeakElement::upgrade)
+                .collect();
+            assert_eq!(bulk, single, "mismatch for {path}");
+            assert_eq!(bulk.len(), 1);
+        }
     }
 
     #[test]
