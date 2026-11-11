@@ -2282,6 +2282,39 @@ impl Element {
         Err(AutosarDataError::NoFilesInModel)
     }
 
+    /// Number of files in this element's (inherited) file membership, without
+    /// materialising the set.
+    ///
+    /// Answers the "is this element shared between files" question that
+    /// [`Element::file_membership`] answers by cloning the whole set.
+    ///
+    /// Returns `None` when no enclosing element restricts the membership (the
+    /// model does not contain any files).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use autosar_data::*;
+    /// let model = AutosarModel::new();
+    /// let file = model.create_file("test", AutosarVersion::Autosar_00050).unwrap();
+    /// let root = model.root_element();
+    /// assert_eq!(root.inherited_file_count(), Some(1));
+    /// ```
+    #[must_use]
+    pub fn inherited_file_count(&self) -> Option<usize> {
+        let mut cur_elem_opt = Some(self.clone());
+        while let Some(cur_elem) = &cur_elem_opt {
+            let locked_cur_elem = cur_elem.0.try_read_for(LOCK_CONTENTION_TIMEOUT)?;
+            if let Some(files) = locked_cur_elem.file_membership.as_deref() {
+                return Some(files.len());
+            }
+            let parent = locked_cur_elem.parent().ok()?;
+            drop(locked_cur_elem);
+            cur_elem_opt = parent;
+        }
+        None
+    }
+
     /// Test whether `file` is part of this element's (inherited) file
     /// membership, without materialising the set.
     ///
