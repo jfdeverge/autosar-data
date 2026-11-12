@@ -2096,7 +2096,10 @@ impl Element {
     pub fn serialize(&self) -> String {
         let mut outstring = String::new();
 
-        self.0.read().serialize_internal(&mut outstring, 0, false, &None, None);
+        self.0
+            .read()
+            .serialize_internal(&mut outstring, 0, false, &None, None)
+            .expect("writing to a String never fails");
 
         outstring
     }
@@ -4378,7 +4381,8 @@ mod test {
         el_autosar
             .0
             .read()
-            .serialize_internal(&mut outstring, 0, false, &None, None);
+            .serialize_internal(&mut outstring, 0, false, &None, None)
+            .unwrap();
 
         assert_eq!(FILEBUF, outstring);
     }

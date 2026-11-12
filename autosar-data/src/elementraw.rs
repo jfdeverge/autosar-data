@@ -1,4 +1,5 @@
 use smallvec::smallvec;
+use std::fmt::Write;
 use std::{borrow::Cow, time::Duration};
 
 use autosar_data_specification::{
@@ -1495,36 +1496,41 @@ impl ElementRaw {
         }
     }
 
-    pub(crate) fn serialize_internal(
+    /// Write this element and its content as arxml text.
+    ///
+    /// Generic over the destination: [`crate::Element::serialize`] and
+    /// [`crate::ArxmlFile::serialize`] collect into a `String`, while
+    /// [`crate::ArxmlFile::serialize_to`] streams straight to the caller's writer.
+    pub(crate) fn serialize_internal<W: Write + ?Sized>(
         &self,
-        outstring: &mut String,
+        outstring: &mut W,
         indent: usize,
         inline: bool,
         for_file: &Option<WeakArxmlFile>,
         file_version: Option<AutosarVersion>,
-    ) {
+    ) -> std::fmt::Result {
         let element_name = self.elemname.to_str();
 
         if let Some(comment) = &self.comment {
             // put the comment on a separate line
             if !inline {
-                Self::serialize_newline_indent(outstring, indent);
+                Self::serialize_newline_indent(outstring, indent)?;
             }
-            outstring.push_str("<!--");
-            outstring.push_str(comment);
-            outstring.push_str("-->");
+            outstring.write_str("<!--")?;
+            outstring.write_str(comment)?;
+            outstring.write_str("-->")?;
         }
 
         // write the opening tag on a new line and indent it
         if !inline {
-            Self::serialize_newline_indent(outstring, indent);
+            Self::serialize_newline_indent(outstring, indent)?;
         }
 
         let content_type = self.elemtype.content_mode().into();
 
         if !self.content.is_empty() {
-            outstring.push('<');
-            outstring.push_str(element_name);
+            outstring.write_char('<')?;
+            outstring.write_str(element_name)?;
             if let Some(file_version) = file_version
                 && for_file.is_some()
                 && self.element_name() == ElementName::Autosar
@@ -1538,11 +1544,11 @@ impl ElementRaw {
                         ));
                     }
                 }
-                Self::serialize_attributes(&attributes, outstring);
+                Self::serialize_attributes(&attributes, outstring)?;
             } else {
-                Self::serialize_attributes(&self.attributes, outstring);
+                Self::serialize_attributes(&self.attributes, outstring)?;
             }
-            outstring.push('>');
+            outstring.write_char('>')?;
 
             match content_type {
                 ContentType::Elements => {
@@ -1551,54 +1557,60 @@ impl ElementRaw {
                         if let ElementContent::Element(subelem) = item
                             && (for_file.is_none() || subelem.0.read().is_in_file(for_file.as_ref().unwrap()))
                         {
-                            subelem
-                                .0
-                                .read()
-                                .serialize_internal(outstring, indent + 1, false, for_file, file_version);
+                            subelem.0.read().serialize_internal(
+                                &mut *outstring,
+                                indent + 1,
+                                false,
+                                for_file,
+                                file_version,
+                            )?;
                         }
                     }
                     // put the closing tag on a new line and indent it
-                    Self::serialize_newline_indent(outstring, indent);
-                    outstring.push_str("</");
-                    outstring.push_str(element_name);
-                    outstring.push('>');
+                    Self::serialize_newline_indent(outstring, indent)?;
+                    outstring.write_str("</")?;
+                    outstring.write_str(element_name)?;
+                    outstring.write_char('>')?;
                 }
                 ContentType::CharacterData => {
                     // write the character data on the same line as the opening tag
                     if let Some(ElementContent::CharacterData(chardata)) = self.content.first() {
-                        chardata.serialize_internal(outstring);
+                        chardata.serialize_internal(outstring)?;
                     }
 
                     // write the closing tag on the same line
-                    outstring.push_str("</");
-                    outstring.push_str(element_name);
-                    outstring.push('>');
+                    outstring.write_str("</")?;
+                    outstring.write_str(element_name)?;
+                    outstring.write_char('>')?;
                 }
                 ContentType::Mixed => {
                     for item in &self.content {
                         match item {
                             ElementContent::Element(subelem) => {
                                 if for_file.is_none() || subelem.0.read().is_in_file(for_file.as_ref().unwrap()) {
-                                    subelem
-                                        .0
-                                        .read()
-                                        .serialize_internal(outstring, indent + 1, true, for_file, None);
+                                    subelem.0.read().serialize_internal(
+                                        &mut *outstring,
+                                        indent + 1,
+                                        true,
+                                        for_file,
+                                        None,
+                                    )?;
                                 }
                             }
                             ElementContent::CharacterData(chardata) => {
-                                chardata.serialize_internal(outstring);
+                                chardata.serialize_internal(outstring)?;
                             }
                         }
                     }
                     // write the closing tag on the same line
-                    outstring.push_str("</");
-                    outstring.push_str(element_name);
-                    outstring.push('>');
+                    outstring.write_str("</")?;
+                    outstring.write_str(element_name)?;
+                    outstring.write_char('>')?;
                 }
             }
         } else {
-            outstring.push('<');
-            outstring.push_str(element_name);
+            outstring.write_char('<')?;
+            outstring.write_str(element_name)?;
             if let Some(file_version) = file_version
                 && for_file.is_some()
                 && self.element_name() == ElementName::Autosar
@@ -1612,32 +1624,33 @@ impl ElementRaw {
                         ));
                     }
                 }
-                Self::serialize_attributes(&attributes, outstring);
+                Self::serialize_attributes(&attributes, outstring)?;
             } else {
-                Self::serialize_attributes(&self.attributes, outstring);
+                Self::serialize_attributes(&self.attributes, outstring)?;
             }
-            outstring.push('/');
-            outstring.push('>');
+            outstring.write_char('/')?;
+            outstring.write_char('>')?;
         }
+        Ok(())
     }
 
-    fn serialize_newline_indent(outstring: &mut String, indent: usize) {
-        outstring.push('\n');
+    fn serialize_newline_indent<W: Write + ?Sized>(outstring: &mut W, indent: usize) -> std::fmt::Result {
+        outstring.write_char('\n')?;
         for _ in 0..indent {
-            outstring.push_str("  ");
+            outstring.write_str("  ")?;
         }
+        Ok(())
     }
 
-    fn serialize_attributes(attributes: &[Attribute], outstring: &mut String) {
-        if !attributes.is_empty() {
-            for attribute in attributes {
-                outstring.push(' ');
-                outstring.push_str(attribute.attrname.to_str());
-                outstring.push_str("=\"");
-                attribute.content.serialize_internal(outstring);
-                outstring.push('"');
-            }
+    fn serialize_attributes<W: Write + ?Sized>(attributes: &[Attribute], outstring: &mut W) -> std::fmt::Result {
+        for attribute in attributes {
+            outstring.write_char(' ')?;
+            outstring.write_str(attribute.attrname.to_str())?;
+            outstring.write_str("=\"")?;
+            attribute.content.serialize_internal(outstring)?;
+            outstring.write_char('"')?;
         }
+        Ok(())
     }
 
     /// get the declaration data of a REFERENCE-BASE element
